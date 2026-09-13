@@ -1,10 +1,19 @@
 const express = require("express");
+const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 const db = require("./lib/db");
 const codes = require("./lib/codes");
 
 const app = express();
+// Allowing all origins here is deliberate, not an oversight: this API has no
+// origin-based trust model at all — every sensitive action is already gated
+// by a join code, PIN, or session token, not by which website is calling it.
+// A browser-hosted HTML app on GitHub Pages, a mobile app, or a curl command
+// from a terminal are all equally "outside browsers" from this server's
+// point of view, so restricting origin would add friction without adding
+// real security.
+app.use(cors());
 app.use(express.json());
 
 // --- rate limiting on the two endpoints that accept a guessable code -------

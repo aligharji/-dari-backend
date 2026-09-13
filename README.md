@@ -16,6 +16,12 @@ Storage is a flat `data.json` file (see `lib/db.js` for why — this was a
 deliberate stand-in for a real database, not an oversight). Delete it to
 reset to a clean state.
 
+**Production note:** set the `DATA_DIR` environment variable to point at a
+mounted persistent volume (e.g. `/data` on Northflank) before deploying —
+without it, `data.json` lives in the container's normal filesystem and gets
+wiped on every restart or redeploy. Locally, leave `DATA_DIR` unset; it
+defaults to the project folder and needs no setup.
+
 ## Endpoints
 
 | Method | Path | Who calls it |
