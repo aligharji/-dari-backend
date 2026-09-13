@@ -2,7 +2,7 @@
 
 A real, running implementation of `auth-flow.md` and `event-schema.md`. No
 mock data — every endpoint below was exercised end-to-end in `test/flow-test.js`
-against this exact code. Eevefjklkfalk;nlke lkjfaenlkn;lkwnfklngiow
+against this exact code.
 
 ## Run it
 
@@ -37,6 +37,7 @@ defaults to the project folder and needs no setup.
 | `POST /api/parent/session/resume` | Parent — reconnect with a stored session token |
 | `POST /api/events` | Log one `interaction_event` or `lesson_summary` |
 | `GET /api/learners/:id/mastery?tagField=grammarPoint\|vocabDomain&tagId=...` | Compute the rolling mastery percentage for one tag |
+| `POST /api/feedback` | Proxy `{system, message}` to Groq, returns `{text}`. Rate-limited (30/10min) since these calls cost real money. Requires `GROQ_API_KEY`. |
 
 ## What's real vs. what's still a stand-in
 

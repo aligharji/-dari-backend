@@ -225,6 +225,69 @@ function safeLearner(learner) {
   return safe;
 }
 
+// =========================================================================
+// FEEDBACK: server-side proxy to Groq, so this works everywhere — not just
+// inside claude.ai, which is the only place a direct browser call to
+// api.anthropic.com gets an auto-injected key. GROQ_API_KEY must be set as
+// an environment variable (same pattern as DATA_DIR) — never sent to the
+// client, never logged.
+//
+// Deliberately generic: this endpoint doesn't know or care about any
+// particular unit's feedback JSON shape (strength/fix/upgrade, etc.) — it
+// just forwards {system, message} to the model and hands back the raw
+// text. Parsing that text into a specific shape stays a client concern,
+// same as it already was when calling Anthropic directly. That keeps this
+// endpoint reusable as more units/tracks get added, instead of every new
+// feedback rubric needing a matching change here.
+const feedbackLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 30, // feedback calls cost real money per request — worth limiting even for a legitimate user hammering retry
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "too_many_requests", message: "Try again in a few minutes." },
+});
+
+app.post("/api/feedback", feedbackLimiter, async (req, res) => {
+  const { system, message } = req.body;
+  if (!system || !message) {
+    return res.status(400).json({ error: "system and message are required" });
+  }
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(503).json({ error: "feedback_not_configured", message: "GROQ_API_KEY is not set on the server." });
+  }
+
+  try {
+    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: message },
+        ],
+        response_format: { type: "json_object" }, // best-effort JSON mode; client still defensively parses either way
+      }),
+    });
+
+    if (!groqRes.ok) {
+      const errBody = await groqRes.text().catch(() => "");
+      return res.status(502).json({ error: "upstream_error", status: groqRes.status, detail: errBody.slice(0, 300) });
+    }
+
+    const data = await groqRes.json();
+    const text = data.choices?.[0]?.message?.content;
+    if (!text) return res.status(502).json({ error: "empty_response" });
+
+    res.json({ text });
+  } catch (e) {
+    res.status(502).json({ error: "upstream_unreachable" });
+  }
+});
+
 const PORT = process.env.PORT || 4000;
 if (require.main === module) {
   app.listen(PORT, () => console.log(`دفتر backend listening on :${PORT}`));
