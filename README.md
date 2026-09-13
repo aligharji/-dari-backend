@@ -2,7 +2,7 @@
 
 A real, running implementation of `auth-flow.md` and `event-schema.md`. No
 mock data — every endpoint below was exercised end-to-end in `test/flow-test.js`
-against this exact code. E
+against this exact code. Eevefjklkfalk;nlke
 
 ## Run it
 
