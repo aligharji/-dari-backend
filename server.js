@@ -91,6 +91,34 @@ function requireTeacherAuthByLearnerId(req, res, next) {
   next();
 }
 
+// Three legitimate viewers for a learner's progress data: the learner
+// themselves, a parent linked to them, or their classroom's teacher.
+// Session tokens (learner/parent) are compared directly since they're
+// already high-entropy bearer tokens, same as everywhere else they're
+// used in this file — only the teacher token is hash-compared, matching
+// how it's stored.
+function requireLearnerDataAccess(req, res, next) {
+  const learner = db.find("learners", (l) => l.learnerId === req.params.id);
+  if (!learner) return res.status(404).json({ error: "learner_not_found" });
+
+  const token = extractToken(req);
+  if (!token) return res.status(401).json({ error: "unauthorized" });
+
+  const asLearner = db.find("sessions", (s) => s.token === token && s.learnerId === learner.learnerId);
+  if (asLearner) { req.learner = learner; return next(); }
+
+  const asParent = db.find("parentSessions", (s) => s.token === token && s.learnerId === learner.learnerId);
+  if (asParent) { req.learner = learner; return next(); }
+
+  const classroom = db.find("classrooms", (c) => c.classroomId === learner.classroomId);
+  if (classroom && codes.hashSecret(token) === classroom.teacherTokenHash) {
+    req.learner = learner;
+    return next();
+  }
+
+  return res.status(401).json({ error: "unauthorized" });
+}
+
 app.post("/api/classrooms/:id/rotate-code", requireTeacherAuthByClassroomId, (req, res) => {
   const classroom = db.update(
     "classrooms",
@@ -246,7 +274,7 @@ app.post("/api/events", (req, res) => {
 
 // mastery rollup — same query shape as the SQL in event-schema.md §3,
 // expressed against the flat-file store.
-app.get("/api/learners/:id/mastery", (req, res) => {
+app.get("/api/learners/:id/mastery", requireLearnerDataAccess, (req, res) => {
   const { tagField, tagId } = req.query; // tagField: "grammarPoint" | "vocabDomain"
   if (!["grammarPoint", "vocabDomain"].includes(tagField)) {
     return res.status(400).json({ error: "tagField must be grammarPoint or vocabDomain" });
@@ -267,7 +295,7 @@ app.get("/api/learners/:id/mastery", (req, res) => {
 // fabricating it client-side, exactly the thing this whole rewiring pass
 // was about stopping. unitsCompleted and streakDays are both derived
 // directly from real event timestamps.
-app.get("/api/learners/:id/summary", (req, res) => {
+app.get("/api/learners/:id/summary", requireLearnerDataAccess, (req, res) => {
   const learnerEvents = db.filter("events", (e) => e.learnerId === req.params.id);
   const summaries = learnerEvents.filter((e) => e.eventType === "lesson_summary");
 

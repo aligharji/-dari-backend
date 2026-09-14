@@ -101,8 +101,14 @@ function log(label, result) {
   log("lesson_summary event", summary);
 
   // 7. Mastery rollup for that grammar point
-  const mastery = await get(`/api/learners/${learnerId}/mastery?tagField=grammarPoint&tagId=verbs.want-structure`);
-  log("mastery rollup (1 correct, 1 incorrect -> 50%)", mastery);
+  const masteryNoAuth = await get(`/api/learners/${learnerId}/mastery?tagField=grammarPoint&tagId=verbs.want-structure`);
+  log("mastery with NO token (expect 401)", masteryNoAuth);
+
+  const mastery = await get(`/api/learners/${learnerId}/mastery?tagField=grammarPoint&tagId=verbs.want-structure`, learnerToken);
+  log("mastery rollup with learner's own token (1 correct, 1 incorrect -> 50%)", mastery);
+
+  const masteryAsTeacher = await get(`/api/learners/${learnerId}/mastery?tagField=grammarPoint&tagId=verbs.want-structure`, teacherToken);
+  log("same mastery, viewed with the TEACHER's token (should also succeed)", masteryAsTeacher);
 
   // 8. Parent link flow
   const parentLink = await post(`/api/learners/${learnerId}/parent-link`, {}, teacherToken);

@@ -57,6 +57,14 @@ defaults to the project folder and needs no setup.
   classroom. That's a real limitation, not an oversight; worth deciding
   before this goes in front of real teachers whether that's acceptable or
   needs a proper account system.
+- **Learner-data authorization**: `GET /api/learners/:id/mastery` and
+  `GET /api/learners/:id/summary` now require `Authorization: Bearer
+  <token>` from one of exactly three legitimate viewers — the learner's
+  own session token, a linked parent's session token, or the classroom's
+  teacher token. A valid token for the *wrong* classroom or a different
+  learner is correctly rejected (`401`), not just "any token accepted" —
+  verified directly: a teacher token from an unrelated classroom cannot
+  read a learner it doesn't own.
 
 **Deliberate stand-ins, not bugs:**
 - `lib/db.js` is a JSON file, not Postgres/SQLite — swap the five functions it
