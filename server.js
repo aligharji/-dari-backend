@@ -43,7 +43,15 @@ app.post("/api/classrooms", (req, res) => {
   // once here and must be stored by the client (same pattern as
   // sessionToken for learners/parents). We store only its hash, so even a
   // dump of data.json can't be used to impersonate a teacher.
+  //
+  // recoveryCode is a SECOND one-time secret, deliberately separate from
+  // teacherToken: teacherToken is what the app stores automatically for
+  // day-to-day use; recoveryCode is what the teacher writes down somewhere
+  // outside the app, and is the only way back in if teacherToken is ever
+  // lost (cleared browser data, new device). No accounts, no email — same
+  // self-custody-code pattern as every other secret in this system.
   const teacherToken = codes.sessionToken();
+  const recovery = codes.recoveryCode();
   const classroom = {
     classroomId: crypto.randomUUID(),
     teacherId,
@@ -51,10 +59,35 @@ app.post("/api/classrooms", (req, res) => {
     joinCode: codes.classroomJoinCode(),
     joinCodeCreatedAt: new Date().toISOString(),
     teacherTokenHash: codes.hashSecret(teacherToken),
+    recoveryCodeHash: codes.hashSecret(recovery),
   };
   db.insert("classrooms", classroom);
-  const { teacherTokenHash, ...safeClassroom } = classroom;
-  res.status(201).json({ ...safeClassroom, teacherToken });
+  const { teacherTokenHash, recoveryCodeHash, ...safeClassroom } = classroom;
+  res.status(201).json({ ...safeClassroom, teacherToken, recoveryCode: recovery });
+});
+
+// Recovery: exchanges a recovery code for a fresh teacherToken. Scans all
+// classrooms rather than taking a classroomId in the URL, because a
+// teacher who's lost their token may not have the classroomId handy
+// either — the recovery code alone should be enough to get back in. Both
+// the teacherToken AND the recovery code are rotated on use, so a
+// recovery code is genuinely single-use, same as the parent-link codes.
+app.post("/api/classrooms/recover", codeGuessLimiter, (req, res) => {
+  const { recoveryCode } = req.body;
+  if (!recoveryCode) return res.status(400).json({ error: "recoveryCode required" });
+
+  const hash = codes.hashSecret(recoveryCode.trim().toUpperCase());
+  const classroom = db.find("classrooms", (c) => c.recoveryCodeHash === hash);
+  if (!classroom) return res.status(404).json({ error: "invalid_recovery_code" });
+
+  const newTeacherToken = codes.sessionToken();
+  const newRecovery = codes.recoveryCode();
+  const updated = db.update("classrooms", (c) => c.classroomId === classroom.classroomId, {
+    teacherTokenHash: codes.hashSecret(newTeacherToken),
+    recoveryCodeHash: codes.hashSecret(newRecovery),
+  });
+  const { teacherTokenHash, recoveryCodeHash, ...safeClassroom } = updated;
+  res.json({ ...safeClassroom, teacherToken: newTeacherToken, recoveryCode: newRecovery });
 });
 
 // -- teacher-auth middleware ------------------------------------------------
@@ -157,7 +190,7 @@ app.post("/api/classrooms/:id/rotate-code", requireTeacherAuthByClassroomId, (re
   );
   // per auth-flow.md §6: rotation only affects *new* joins — existing
   // learner records and their sessions are untouched by this call.
-  const { teacherTokenHash, ...safe } = classroom;
+  const { teacherTokenHash, recoveryCodeHash, ...safe } = classroom;
   res.json(safe);
 });
 

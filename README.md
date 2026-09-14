@@ -30,6 +30,7 @@ defaults to the project folder and needs no setup.
 | `POST /api/classrooms/:id/rotate-code` | Teacher — invalidate the old code, issue a new one |
 | `GET /api/classrooms/:id/pending` | Teacher — see learners awaiting approval |
 | `POST /api/enrollments/:id/approve` | Teacher — activate a pending enrollment (not the learner directly — one learner can have several) |
+| `POST /api/classrooms/recover` | Exchange a saved `recoveryCode` for a fresh `teacherToken` — rotates both, old token dies immediately |
 | `POST /api/join` | Learner — join with a classroom code + nickname + PIN. If called with an existing learner session token instead, attaches a new enrollment to that learner in a second classroom (rate-limited) |
 | `POST /api/session/resume` | Learner — reconnect with a stored session token |
 | `POST /api/learners/:id/parent-link` | Generate a single-use, 7-day parent invite code |
@@ -58,11 +59,17 @@ defaults to the project folder and needs no setup.
   (`rotate-code`, `pending`, `approve`, `parent-link`) requires it as
   `Authorization: Bearer <token>` and rejects requests with a missing or
   wrong token (`401 unauthorized_teacher`). Only the token's hash is
-  stored server-side. There is **no recovery path** if a token is lost —
-  no accounts, no password reset — losing it means creating a new
-  classroom. That's a real limitation, not an oversight; worth deciding
-  before this goes in front of real teachers whether that's acceptable or
-  needs a proper account system.
+  stored server-side.
+- **Token recovery**: alongside `teacherToken`, classroom creation also
+  returns a `recoveryCode` — a second one-time secret meant to be saved
+  *outside* the app (paper, password manager). If `teacherToken` is ever
+  lost, `POST /api/classrooms/recover` exchanges the recovery code for a
+  fresh token — and issues a fresh recovery code too, since the old one is
+  now spent. Verified directly: after recovery, the old token immediately
+  returns `401`, the new token works, and reusing the same recovery code
+  a second time fails. Still no email, no password, no accounts — same
+  self-custody-code pattern as everything else in this system, just with
+  a real way back in when a secret is lost.
 - **Learner-data authorization**: `GET /api/learners/:id/mastery` and
   `GET /api/learners/:id/summary` now require `Authorization: Bearer
   <token>` from one of exactly three legitimate viewers — the learner's

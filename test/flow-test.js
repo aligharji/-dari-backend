@@ -147,5 +147,22 @@ function log(label, result) {
   const resumeAfter = await post("/api/session/resume", { token: learnerToken });
   log("resume AFTER approving classroom 2 — expect BOTH active now", resumeAfter);
 
+  // 10. Recovery: lose the original teacherToken, regain access via the
+  // recovery code shown once at classroom creation. Confirms the old
+  // token dies and the recovery code is genuinely single-use.
+  const originalToken = classroom.data.teacherToken;
+  const recovery = await post("/api/classrooms/recover", { recoveryCode: classroom.data.recoveryCode });
+  log("recover access using the saved recovery code", recovery);
+  const newToken = recovery.data.teacherToken;
+
+  const oldTokenNowDead = await get(`/api/classrooms/${classroomId}/pending`, originalToken);
+  log("OLD token after recovery — expect 401", oldTokenNowDead);
+
+  const newTokenWorks = await get(`/api/classrooms/${classroomId}/pending`, newToken);
+  log("NEW token after recovery — expect 200", newTokenWorks);
+
+  const reuseOldRecoveryCode = await post("/api/classrooms/recover", { recoveryCode: classroom.data.recoveryCode });
+  log("reusing the SAME (now old) recovery code — expect failure", reuseOldRecoveryCode);
+
   console.log("\n=== FLOW TEST COMPLETE ===");
 })();
