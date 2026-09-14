@@ -46,7 +46,15 @@ defaults to the project folder and needs no setup.
 - The approval gate (a guessed/overheard join code doesn't grant access on its own)
 - PIN-protected returning-learner resolution (new device, same identity, no duplicate record)
 - Single-use, expiring parent link codes
-- Rate limiting on both code-guessing endpoints
+- Rate limiting on both code-guessing endpoints — and `app.set("trust
+  proxy", 1)`, without which express-rate-limit can't safely tell clients
+  apart behind Northflank's reverse proxy. Found by reproducing the
+  deployed environment locally (a spoofed `X-Forwarded-For` header via
+  curl) rather than assuming it worked because it passed tests run
+  directly against localhost, which never goes through a proxy. Verified
+  concretely: one simulated client correctly gets rate-limited at
+  request 21, while a second, different simulated client is completely
+  unaffected — proving per-client buckets, not one shared global one.
 - Mastery rollup computed from the raw event log, not stored redundantly
 - **Retention sweep**: `open_writing` and `open_speaking` responses are
   cleared (`responseValue` set to `null`, rest of the record kept intact)

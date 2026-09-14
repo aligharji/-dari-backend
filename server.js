@@ -7,6 +7,18 @@ const codes = require("./lib/codes");
 const { sweepExpiredResponses } = require("./lib/retentionSweep");
 
 const app = express();
+
+// Northflank (and most platforms) sit the app behind a single reverse
+// proxy, which sets X-Forwarded-For. Without telling Express to trust
+// exactly one proxy hop, express-rate-limit can't safely determine each
+// client's real IP — found by actually reproducing the deployed
+// environment locally (curl with a spoofed X-Forwarded-For header) rather
+// than assuming the rate limiter worked just because it passed tests
+// running directly against localhost, which never goes through a proxy.
+// "1" means trust exactly one hop; a client can't spoof past that because
+// Express only reads the entry the proxy itself appended.
+app.set("trust proxy", 1);
+
 // Allowing all origins here is deliberate, not an oversight: this API has no
 // origin-based trust model at all — every sensitive action is already gated
 // by a join code, PIN, or session token, not by which website is calling it.
