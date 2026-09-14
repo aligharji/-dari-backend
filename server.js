@@ -260,6 +260,43 @@ app.get("/api/learners/:id/mastery", (req, res) => {
   res.json({ tagField, tagId, sampleSize: recent.length, pct });
 });
 
+// Powers the Parent dashboard's summary card. Deliberately doesn't include
+// time-on-task ("weekly minutes") — nothing in the event schema actually
+// measures real duration yet (lesson_summary's totalDurationMs is sent as
+// null by the client today), so reporting a number there would mean
+// fabricating it client-side, exactly the thing this whole rewiring pass
+// was about stopping. unitsCompleted and streakDays are both derived
+// directly from real event timestamps.
+app.get("/api/learners/:id/summary", (req, res) => {
+  const learnerEvents = db.filter("events", (e) => e.learnerId === req.params.id);
+  const summaries = learnerEvents.filter((e) => e.eventType === "lesson_summary");
+
+  const activityDates = [...new Set(
+    learnerEvents.map((e) => new Date(e.serverTimestamp).toISOString().slice(0, 10))
+  )].sort().reverse(); // most recent date first
+
+  let streakDays = 0;
+  if (activityDates.length) {
+    let cursor = new Date();
+    for (const dateStr of activityDates) {
+      const cursorStr = cursor.toISOString().slice(0, 10);
+      if (dateStr !== cursorStr) break; // gap in activity (or most recent day wasn't today) — streak ends here
+      streakDays++;
+      cursor.setDate(cursor.getDate() - 1);
+    }
+  }
+
+  const lastActiveAt = learnerEvents.length
+    ? learnerEvents.sort((a, b) => new Date(b.serverTimestamp) - new Date(a.serverTimestamp))[0].serverTimestamp
+    : null;
+
+  res.json({
+    unitsCompleted: summaries.length,
+    streakDays,
+    lastActiveAt,
+  });
+});
+
 function safeLearner(learner) {
   if (!learner) return null;
   const { pinHash, ...safe } = learner;
