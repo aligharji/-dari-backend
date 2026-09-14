@@ -264,7 +264,10 @@ app.post("/api/feedback", feedbackLimiter, async (req, res) => {
         "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
+        model: // llama-3.3-70b-versatile was deprecated/shut down by Groq on
+// 2026-08-16 — openai/gpt-oss-120b is their official recommended
+// replacement (console.groq.com/docs/deprecations).
+model: "openai/gpt-oss-120b",
         messages: [
           { role: "system", content: system },
           { role: "user", content: message },
