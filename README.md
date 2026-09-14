@@ -47,6 +47,16 @@ defaults to the project folder and needs no setup.
 - Single-use, expiring parent link codes
 - Rate limiting on both code-guessing endpoints
 - Mastery rollup computed from the raw event log, not stored redundantly
+- **Teacher-endpoint authorization**: `POST /api/classrooms` returns a
+  `teacherToken` exactly once, at creation. Every other teacher-only route
+  (`rotate-code`, `pending`, `approve`, `parent-link`) requires it as
+  `Authorization: Bearer <token>` and rejects requests with a missing or
+  wrong token (`401 unauthorized_teacher`). Only the token's hash is
+  stored server-side. There is **no recovery path** if a token is lost —
+  no accounts, no password reset — losing it means creating a new
+  classroom. That's a real limitation, not an oversight; worth deciding
+  before this goes in front of real teachers whether that's acceptable or
+  needs a proper account system.
 
 **Deliberate stand-ins, not bugs:**
 - `lib/db.js` is a JSON file, not Postgres/SQLite — swap the five functions it
@@ -54,7 +64,3 @@ defaults to the project folder and needs no setup.
 - The `open_writing` 48-hour retention flag is set on write
   (`responseRetentionExpiresAt`), but nothing actually sweeps and deletes
   expired responses yet — that's a scheduled job this prototype doesn't have.
-- No auth on the teacher-only endpoints yet (`POST /api/classrooms`, the
-  approve/rotate/parent-link routes) — in production these need to verify
-  the caller is actually that classroom's teacher, not just accept any
-  `teacherId` the client sends.

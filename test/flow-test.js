@@ -1,16 +1,21 @@
 const BASE = "http://localhost:4000";
 
-async function post(path, body) {
+async function post(path, body, token) {
   const res = await fetch(BASE + path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify(body || {}),
   });
   const data = await res.json().catch(() => ({}));
   return { status: res.status, data };
 }
-async function get(path) {
-  const res = await fetch(BASE + path);
+async function get(path, token) {
+  const res = await fetch(BASE + path, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
   const data = await res.json().catch(() => ({}));
   return { status: res.status, data };
 }
@@ -24,7 +29,13 @@ function log(label, result) {
   // 1. Teacher creates a classroom
   const classroom = await post("/api/classrooms", { teacherId: "t1", name: "صنف الف" });
   log("create classroom", classroom);
-  const { joinCode, classroomId } = classroom.data;
+  const { joinCode, classroomId, teacherToken } = classroom.data;
+
+  // 1b. teacher-only endpoints should reject a request with no/wrong token
+  const noAuth = await get(`/api/classrooms/${classroomId}/pending`);
+  log("pending list with NO token (expect 401)", noAuth);
+  const wrongAuth = await get(`/api/classrooms/${classroomId}/pending`, "not-the-real-token");
+  log("pending list with WRONG token (expect 401)", wrongAuth);
 
   // 2. Learner joins -> should land pending
   const join1 = await post("/api/join", { joinCode, nickname: "احمد", pin: "1234" });
@@ -39,12 +50,12 @@ function log(label, result) {
   const impostor = await post("/api/join", { joinCode, nickname: "احمد", pin: "9999" });
   log("different pin, same nickname -> should be rejected", impostor);
 
-  // 3. Teacher sees pending list
-  const pending = await get(`/api/classrooms/${classroomId}/pending`);
-  log("teacher's pending list", pending);
+  // 3. Teacher sees pending list (now requires the real teacherToken)
+  const pending = await get(`/api/classrooms/${classroomId}/pending`, teacherToken);
+  log("teacher's pending list (with real token)", pending);
 
-  // 4. Teacher approves
-  const approve = await post(`/api/learners/${learnerId}/approve`, {});
+  // 4. Teacher approves (also requires the token)
+  const approve = await post(`/api/learners/${learnerId}/approve`, {}, teacherToken);
   log("teacher approves", approve);
   const learnerToken = approve.data.sessionToken;
 
@@ -94,7 +105,7 @@ function log(label, result) {
   log("mastery rollup (1 correct, 1 incorrect -> 50%)", mastery);
 
   // 8. Parent link flow
-  const parentLink = await post(`/api/learners/${learnerId}/parent-link`, {});
+  const parentLink = await post(`/api/learners/${learnerId}/parent-link`, {}, teacherToken);
   log("teacher/app generates parent link code", parentLink);
   const linkCode = parentLink.data.linkCode;
 

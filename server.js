@@ -36,30 +36,74 @@ app.post("/api/classrooms", (req, res) => {
   const { teacherId, name } = req.body;
   if (!teacherId || !name) return res.status(400).json({ error: "teacherId and name required" });
 
+  // teacherId is now just a display label the client sends, not a security
+  // credential — actual authorization for every subsequent teacher action
+  // on this classroom is the teacherToken below, which is shown exactly
+  // once here and must be stored by the client (same pattern as
+  // sessionToken for learners/parents). We store only its hash, so even a
+  // dump of data.json can't be used to impersonate a teacher.
+  const teacherToken = codes.sessionToken();
   const classroom = {
     classroomId: crypto.randomUUID(),
     teacherId,
     name,
     joinCode: codes.classroomJoinCode(),
     joinCodeCreatedAt: new Date().toISOString(),
+    teacherTokenHash: codes.hashSecret(teacherToken),
   };
   db.insert("classrooms", classroom);
-  res.status(201).json(classroom);
+  const { teacherTokenHash, ...safeClassroom } = classroom;
+  res.status(201).json({ ...safeClassroom, teacherToken });
 });
 
-app.post("/api/classrooms/:id/rotate-code", (req, res) => {
+// -- teacher-auth middleware ------------------------------------------------
+// Two variants because "which classroom does this request act on" is
+// resolved differently depending on the route shape: some routes have
+// :id = classroomId directly, others have :id = learnerId and need one
+// extra lookup to find the owning classroom first.
+function extractToken(req) {
+  const header = req.headers.authorization || "";
+  return header.startsWith("Bearer ") ? header.slice(7) : null;
+}
+
+function requireTeacherAuthByClassroomId(req, res, next) {
+  const classroom = db.find("classrooms", (c) => c.classroomId === req.params.id);
+  if (!classroom) return res.status(404).json({ error: "classroom_not_found" });
+  const token = extractToken(req);
+  if (!token || codes.hashSecret(token) !== classroom.teacherTokenHash) {
+    return res.status(401).json({ error: "unauthorized_teacher" });
+  }
+  req.classroom = classroom;
+  next();
+}
+
+function requireTeacherAuthByLearnerId(req, res, next) {
+  const learner = db.find("learners", (l) => l.learnerId === req.params.id);
+  if (!learner) return res.status(404).json({ error: "learner_not_found" });
+  const classroom = db.find("classrooms", (c) => c.classroomId === learner.classroomId);
+  if (!classroom) return res.status(404).json({ error: "classroom_not_found" });
+  const token = extractToken(req);
+  if (!token || codes.hashSecret(token) !== classroom.teacherTokenHash) {
+    return res.status(401).json({ error: "unauthorized_teacher" });
+  }
+  req.classroom = classroom;
+  req.learner = learner;
+  next();
+}
+
+app.post("/api/classrooms/:id/rotate-code", requireTeacherAuthByClassroomId, (req, res) => {
   const classroom = db.update(
     "classrooms",
     (c) => c.classroomId === req.params.id,
     { joinCode: codes.classroomJoinCode(), joinCodeCreatedAt: new Date().toISOString() }
   );
-  if (!classroom) return res.status(404).json({ error: "classroom_not_found" });
   // per auth-flow.md §6: rotation only affects *new* joins — existing
   // learner records and their sessions are untouched by this call.
-  res.json(classroom);
+  const { teacherTokenHash, ...safe } = classroom;
+  res.json(safe);
 });
 
-app.get("/api/classrooms/:id/pending", (req, res) => {
+app.get("/api/classrooms/:id/pending", requireTeacherAuthByClassroomId, (req, res) => {
   const pending = db.filter(
     "learners",
     (l) => l.classroomId === req.params.id && l.status === "pending"
@@ -67,14 +111,12 @@ app.get("/api/classrooms/:id/pending", (req, res) => {
   res.json(pending.map(({ pinHash, ...safe }) => safe)); // never return the PIN hash
 });
 
-app.post("/api/learners/:id/approve", (req, res) => {
+app.post("/api/learners/:id/approve", requireTeacherAuthByLearnerId, (req, res) => {
   const learner = db.update(
     "learners",
     (l) => l.learnerId === req.params.id,
     { status: "active" }
   );
-  if (!learner) return res.status(404).json({ error: "learner_not_found" });
-
   const session = { token: codes.sessionToken(), learnerId: learner.learnerId, createdAt: new Date().toISOString() };
   db.insert("sessions", session);
   res.json({ learner: safeLearner(learner), sessionToken: session.token });
@@ -102,7 +144,7 @@ app.post("/api/join", codeGuessLimiter, (req, res) => {
     (l) => l.classroomId === classroom.classroomId && l.displayNickname === nickname
   );
   if (existing) {
-    if (existing.pinHash !== codes.hashPin(pin)) {
+    if (existing.pinHash !== codes.hashSecret(pin)) {
       return res.status(409).json({ error: "nickname_taken", message: "That name is already in use in this class — try another, or check your PIN." });
     }
     if (existing.status === "pending") {
@@ -117,7 +159,7 @@ app.post("/api/join", codeGuessLimiter, (req, res) => {
     learnerId: crypto.randomUUID(),
     classroomId: classroom.classroomId,
     displayNickname: nickname,
-    pinHash: codes.hashPin(pin),
+    pinHash: codes.hashSecret(pin),
     status: "pending",
     createdAt: new Date().toISOString(),
   };
@@ -137,9 +179,8 @@ app.post("/api/session/resume", (req, res) => {
 // PARENT: link to a specific learner, resume a session
 // =========================================================================
 
-app.post("/api/learners/:id/parent-link", (req, res) => {
-  const learner = db.find("learners", (l) => l.learnerId === req.params.id);
-  if (!learner) return res.status(404).json({ error: "learner_not_found" });
+app.post("/api/learners/:id/parent-link", requireTeacherAuthByLearnerId, (req, res) => {
+  const learner = req.learner;
 
   const link = {
     linkId: crypto.randomUUID(),
@@ -264,7 +305,10 @@ app.post("/api/feedback", feedbackLimiter, async (req, res) => {
         "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
+        // llama-3.3-70b-versatile was deprecated/shut down by Groq on
+        // 2026-08-16 — openai/gpt-oss-120b is their official recommended
+        // replacement (console.groq.com/docs/deprecations).
+        model: "openai/gpt-oss-120b",
         messages: [
           { role: "system", content: system },
           { role: "user", content: message },
