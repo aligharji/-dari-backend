@@ -6,23 +6,12 @@ const db = require("./lib/db");
 const codes = require("./lib/codes");
 
 const app = express();
-// Allowing all origins here is deliberate, not an oversight: this API has no
-// origin-based trust model at all — every sensitive action is already gated
-// by a join code, PIN, or session token, not by which website is calling it.
-// A browser-hosted HTML app on GitHub Pages, a mobile app, or a curl command
-// from a terminal are all equally "outside browsers" from this server's
-// point of view, so restricting origin would add friction without adding
-// real security.
 app.use(cors());
 app.use(express.json());
 
-// --- rate limiting on the two endpoints that accept a guessable code -------
-// This was an explicitly open item in auth-flow.md §6 ("needs to live at the
-// API layer, not designed in this document") — closing it here since it's
-// cheap and directly protects the join-code brute-force surface.
 const codeGuessLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000, // 10 minutes
-  max: 20,                   // 20 attempts per IP per window
+  windowMs: 10 * 60 * 1000,
+  max: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "too_many_attempts", message: "Try again later." },
@@ -54,8 +43,6 @@ app.post("/api/classrooms/:id/rotate-code", (req, res) => {
     { joinCode: codes.classroomJoinCode(), joinCodeCreatedAt: new Date().toISOString() }
   );
   if (!classroom) return res.status(404).json({ error: "classroom_not_found" });
-  // per auth-flow.md §6: rotation only affects *new* joins — existing
-  // learner records and their sessions are untouched by this call.
   res.json(classroom);
 });
 
@@ -64,7 +51,7 @@ app.get("/api/classrooms/:id/pending", (req, res) => {
     "learners",
     (l) => l.classroomId === req.params.id && l.status === "pending"
   );
-  res.json(pending.map(({ pinHash, ...safe }) => safe)); // never return the PIN hash
+  res.json(pending.map(({ pinHash, ...safe }) => safe));
 });
 
 app.post("/api/learners/:id/approve", (req, res) => {
@@ -94,9 +81,6 @@ app.post("/api/join", codeGuessLimiter, (req, res) => {
   const classroom = db.find("classrooms", (c) => c.joinCode === joinCode.toUpperCase());
   if (!classroom) return res.status(404).json({ error: "invalid_join_code" });
 
-  // returning-learner path: same nickname + matching PIN in this classroom
-  // resumes the existing learnerId instead of creating a duplicate pending
-  // request — auth-flow.md §4.
   const existing = db.find(
     "learners",
     (l) => l.classroomId === classroom.classroomId && l.displayNickname === nickname
@@ -187,10 +171,6 @@ app.post("/api/events", (req, res) => {
   if (!event.learnerId || !event.eventType) {
     return res.status(400).json({ error: "learnerId and eventType are required" });
   }
-  // open_writing responses get a short, explicit TTL rather than living
-  // forever in the same table as a tapped multiple-choice answer —
-  // event-schema.md §4. The raw text is dropped by a separate sweep job in
-  // production; here we just tag it so that job has something to find.
   const record = {
     eventId: crypto.randomUUID(),
     serverTimestamp: new Date().toISOString(),
@@ -203,10 +183,8 @@ app.post("/api/events", (req, res) => {
   res.status(201).json({ eventId: record.eventId });
 });
 
-// mastery rollup — same query shape as the SQL in event-schema.md §3,
-// expressed against the flat-file store.
 app.get("/api/learners/:id/mastery", (req, res) => {
-  const { tagField, tagId } = req.query; // tagField: "grammarPoint" | "vocabDomain"
+  const { tagField, tagId } = req.query;
   if (!["grammarPoint", "vocabDomain"].includes(tagField)) {
     return res.status(400).json({ error: "tagField must be grammarPoint or vocabDomain" });
   }
@@ -225,23 +203,9 @@ function safeLearner(learner) {
   return safe;
 }
 
-// =========================================================================
-// FEEDBACK: server-side proxy to Groq, so this works everywhere — not just
-// inside claude.ai, which is the only place a direct browser call to
-// api.anthropic.com gets an auto-injected key. GROQ_API_KEY must be set as
-// an environment variable (same pattern as DATA_DIR) — never sent to the
-// client, never logged.
-//
-// Deliberately generic: this endpoint doesn't know or care about any
-// particular unit's feedback JSON shape (strength/fix/upgrade, etc.) — it
-// just forwards {system, message} to the model and hands back the raw
-// text. Parsing that text into a specific shape stays a client concern,
-// same as it already was when calling Anthropic directly. That keeps this
-// endpoint reusable as more units/tracks get added, instead of every new
-// feedback rubric needing a matching change here.
 const feedbackLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
-  max: 30, // feedback calls cost real money per request — worth limiting even for a legitimate user hammering retry
+  max: 30,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "too_many_requests", message: "Try again in a few minutes." },
@@ -264,15 +228,12 @@ app.post("/api/feedback", feedbackLimiter, async (req, res) => {
         "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-        model: // llama-3.3-70b-versatile was deprecated/shut down by Groq on
-// 2026-08-16 — openai/gpt-oss-120b is their official recommended
-// replacement (console.groq.com/docs/deprecations).
-model: "openai/gpt-oss-120b",
+        model: "openai/gpt-oss-120b",
         messages: [
           { role: "system", content: system },
           { role: "user", content: message },
         ],
-        response_format: { type: "json_object" }, // best-effort JSON mode; client still defensively parses either way
+        response_format: { type: "json_object" },
       }),
     });
 
