@@ -29,8 +29,8 @@ defaults to the project folder and needs no setup.
 | `POST /api/classrooms` | Teacher — create a classroom, get a join code |
 | `POST /api/classrooms/:id/rotate-code` | Teacher — invalidate the old code, issue a new one |
 | `GET /api/classrooms/:id/pending` | Teacher — see learners awaiting approval |
-| `POST /api/learners/:id/approve` | Teacher — activate a pending learner, issue their session token |
-| `POST /api/join` | Learner — join with a classroom code + nickname + PIN (rate-limited) |
+| `POST /api/enrollments/:id/approve` | Teacher — activate a pending enrollment (not the learner directly — one learner can have several) |
+| `POST /api/join` | Learner — join with a classroom code + nickname + PIN. If called with an existing learner session token instead, attaches a new enrollment to that learner in a second classroom (rate-limited) |
 | `POST /api/session/resume` | Learner — reconnect with a stored session token |
 | `POST /api/learners/:id/parent-link` | Generate a single-use, 7-day parent invite code |
 | `POST /api/parent/join` | Parent — redeem a link code (rate-limited, single-use) |
@@ -47,6 +47,12 @@ defaults to the project folder and needs no setup.
 - Single-use, expiring parent link codes
 - Rate limiting on both code-guessing endpoints
 - Mastery rollup computed from the raw event log, not stored redundantly
+- **Retention sweep**: `open_writing` and `open_speaking` responses are
+  cleared (`responseValue` set to `null`, rest of the record kept intact)
+  once `responseRetentionExpiresAt` passes. Runs once at server startup
+  (catches anything that expired while the process was down) and hourly
+  after that. Tested directly against expired/future/already-swept/
+  unrelated records — see `lib/retentionSweep.js`.
 - **Teacher-endpoint authorization**: `POST /api/classrooms` returns a
   `teacherToken` exactly once, at creation. Every other teacher-only route
   (`rotate-code`, `pending`, `approve`, `parent-link`) requires it as
@@ -65,10 +71,22 @@ defaults to the project folder and needs no setup.
   learner is correctly rejected (`401`), not just "any token accepted" —
   verified directly: a teacher token from an unrelated classroom cannot
   read a learner it doesn't own.
+- **Multi-classroom support**: `classroomId` moved off the `learner`
+  record entirely, into a separate `enrollments` collection
+  (`{ enrollmentId, learnerId, classroomId, status }`). One person can now
+  hold independent memberships — each with its own pending/active status
+  — across multiple classrooms and teachers at once. If a request carries
+  a valid existing learner session, `POST /api/join` attaches a *new*
+  enrollment to that same `learnerId` instead of creating a disconnected
+  duplicate identity; without one, it falls back to the original
+  nickname+PIN flow, scoped per-classroom exactly as before (no
+  cross-classroom identity merging by nickname guess). Approval is now a
+  per-**enrollment** action (`POST /api/enrollments/:id/approve`), since a
+  learner can be pending in one classroom and already active in another
+  simultaneously. Verified end-to-end: same learner, two unrelated
+  classrooms, independent approval in each, neither affecting the other's
+  status.
 
 **Deliberate stand-ins, not bugs:**
 - `lib/db.js` is a JSON file, not Postgres/SQLite — swap the five functions it
   exports for real DB calls; nothing in `server.js` should need to change.
-- The `open_writing` 48-hour retention flag is set on write
-  (`responseRetentionExpiresAt`), but nothing actually sweeps and deletes
-  expired responses yet — that's a scheduled job this prototype doesn't have.

@@ -50,12 +50,14 @@ function log(label, result) {
   const impostor = await post("/api/join", { joinCode, nickname: "احمد", pin: "9999" });
   log("different pin, same nickname -> should be rejected", impostor);
 
-  // 3. Teacher sees pending list (now requires the real teacherToken)
+  // 3. Teacher sees pending list (now enrollment-shaped, requires real teacherToken)
   const pending = await get(`/api/classrooms/${classroomId}/pending`, teacherToken);
   log("teacher's pending list (with real token)", pending);
+  const enrollmentId = pending.data[0].enrollmentId;
 
-  // 4. Teacher approves (also requires the token)
-  const approve = await post(`/api/learners/${learnerId}/approve`, {}, teacherToken);
+  // 4. Teacher approves the ENROLLMENT (not the learner directly — a learner
+  // can have multiple enrollments now, so approval is scoped per-classroom)
+  const approve = await post(`/api/enrollments/${enrollmentId}/approve`, {}, teacherToken);
   log("teacher approves", approve);
   const learnerToken = approve.data.sessionToken;
 
@@ -124,6 +126,26 @@ function log(label, result) {
 
   const parentResume = await post("/api/parent/session/resume", { token: parentToken });
   log("parent resumes session", parentResume);
+
+  // 9. Multi-classroom: the SAME learner (via their existing session token)
+  // joins a SECOND, unrelated classroom — should get a new, independent
+  // enrollment attached to their existing learnerId, not a duplicate person.
+  const classroom2 = await post("/api/classrooms", { teacherId: "t2", name: "صنف ب" });
+  log("create a second, unrelated classroom", classroom2);
+  const { joinCode: joinCode2, classroomId: classroomId2, teacherToken: teacherToken2 } = classroom2.data;
+
+  const join2 = await post("/api/join", { joinCode: joinCode2, nickname: "x", pin: "0000" }, learnerToken);
+  log("same learner joins classroom 2, using their existing session token", join2);
+
+  const resumeBefore = await post("/api/session/resume", { token: learnerToken });
+  log("resume BEFORE approving classroom 2 — expect active in class 1, pending in class 2", resumeBefore);
+
+  const pending2 = await get(`/api/classrooms/${classroomId2}/pending`, teacherToken2);
+  const enrollmentId2 = pending2.data[0].enrollmentId;
+  await post(`/api/enrollments/${enrollmentId2}/approve`, {}, teacherToken2);
+
+  const resumeAfter = await post("/api/session/resume", { token: learnerToken });
+  log("resume AFTER approving classroom 2 — expect BOTH active now", resumeAfter);
 
   console.log("\n=== FLOW TEST COMPLETE ===");
 })();

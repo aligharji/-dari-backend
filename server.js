@@ -4,6 +4,7 @@ const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 const db = require("./lib/db");
 const codes = require("./lib/codes");
+const { sweepExpiredResponses } = require("./lib/retentionSweep");
 
 const app = express();
 // Allowing all origins here is deliberate, not an oversight: this API has no
@@ -57,10 +58,12 @@ app.post("/api/classrooms", (req, res) => {
 });
 
 // -- teacher-auth middleware ------------------------------------------------
-// Two variants because "which classroom does this request act on" is
-// resolved differently depending on the route shape: some routes have
-// :id = classroomId directly, others have :id = learnerId and need one
-// extra lookup to find the owning classroom first.
+// Learner identity (learners collection) is now separate from classroom
+// membership (enrollments collection) — a person can hold multiple
+// enrollments across different classrooms/teachers, so "which classroom
+// does this request act on" has to resolve through an enrollment lookup
+// wherever the route is scoped by learnerId rather than classroomId
+// directly.
 function extractToken(req) {
   const header = req.headers.authorization || "";
   return header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -77,26 +80,53 @@ function requireTeacherAuthByClassroomId(req, res, next) {
   next();
 }
 
-function requireTeacherAuthByLearnerId(req, res, next) {
-  const learner = db.find("learners", (l) => l.learnerId === req.params.id);
-  if (!learner) return res.status(404).json({ error: "learner_not_found" });
-  const classroom = db.find("classrooms", (c) => c.classroomId === learner.classroomId);
+// Used for the /api/enrollments/:id/approve route — :id is an enrollmentId,
+// not a learnerId or classroomId, since approval is now a per-enrollment
+// action (a learner could be pending in one classroom and already active
+// in another at the same time).
+function requireTeacherAuthByEnrollmentId(req, res, next) {
+  const enrollment = db.find("enrollments", (e) => e.enrollmentId === req.params.id);
+  if (!enrollment) return res.status(404).json({ error: "enrollment_not_found" });
+  const classroom = db.find("classrooms", (c) => c.classroomId === enrollment.classroomId);
   if (!classroom) return res.status(404).json({ error: "classroom_not_found" });
   const token = extractToken(req);
   if (!token || codes.hashSecret(token) !== classroom.teacherTokenHash) {
     return res.status(401).json({ error: "unauthorized_teacher" });
   }
+  const learner = db.find("learners", (l) => l.learnerId === enrollment.learnerId);
+  req.enrollment = enrollment;
   req.classroom = classroom;
   req.learner = learner;
   next();
 }
 
+// Used for /api/learners/:id/parent-link — a learner may have enrollments
+// across several classrooms with different teachers, so this accepts a
+// token from ANY teacher who shares an enrollment relationship with this
+// learner, not just one fixed classroom.
+function requireTeacherAuthByLearnerId(req, res, next) {
+  const learner = db.find("learners", (l) => l.learnerId === req.params.id);
+  if (!learner) return res.status(404).json({ error: "learner_not_found" });
+  const token = extractToken(req);
+  if (!token) return res.status(401).json({ error: "unauthorized_teacher" });
+
+  const learnerClassroomIds = db.filter("enrollments", (e) => e.learnerId === learner.learnerId).map((e) => e.classroomId);
+  const matchingClassroom = learnerClassroomIds
+    .map((cid) => db.find("classrooms", (c) => c.classroomId === cid))
+    .find((c) => c && codes.hashSecret(token) === c.teacherTokenHash);
+
+  if (!matchingClassroom) return res.status(401).json({ error: "unauthorized_teacher" });
+  req.classroom = matchingClassroom;
+  req.learner = learner;
+  next();
+}
+
 // Three legitimate viewers for a learner's progress data: the learner
-// themselves, a parent linked to them, or their classroom's teacher.
-// Session tokens (learner/parent) are compared directly since they're
-// already high-entropy bearer tokens, same as everywhere else they're
-// used in this file — only the teacher token is hash-compared, matching
-// how it's stored.
+// themselves, a parent linked to them, or any teacher sharing an
+// enrollment with them (same "any of their classrooms' teachers" logic as
+// requireTeacherAuthByLearnerId above). Session tokens (learner/parent)
+// are compared directly since they're already high-entropy bearer tokens;
+// only the teacher token is hash-compared, matching how it's stored.
 function requireLearnerDataAccess(req, res, next) {
   const learner = db.find("learners", (l) => l.learnerId === req.params.id);
   if (!learner) return res.status(404).json({ error: "learner_not_found" });
@@ -110,11 +140,11 @@ function requireLearnerDataAccess(req, res, next) {
   const asParent = db.find("parentSessions", (s) => s.token === token && s.learnerId === learner.learnerId);
   if (asParent) { req.learner = learner; return next(); }
 
-  const classroom = db.find("classrooms", (c) => c.classroomId === learner.classroomId);
-  if (classroom && codes.hashSecret(token) === classroom.teacherTokenHash) {
-    req.learner = learner;
-    return next();
-  }
+  const learnerClassroomIds = db.filter("enrollments", (e) => e.learnerId === learner.learnerId).map((e) => e.classroomId);
+  const asTeacher = learnerClassroomIds
+    .map((cid) => db.find("classrooms", (c) => c.classroomId === cid))
+    .some((c) => c && codes.hashSecret(token) === c.teacherTokenHash);
+  if (asTeacher) { req.learner = learner; return next(); }
 
   return res.status(401).json({ error: "unauthorized" });
 }
@@ -132,22 +162,32 @@ app.post("/api/classrooms/:id/rotate-code", requireTeacherAuthByClassroomId, (re
 });
 
 app.get("/api/classrooms/:id/pending", requireTeacherAuthByClassroomId, (req, res) => {
-  const pending = db.filter(
-    "learners",
-    (l) => l.classroomId === req.params.id && l.status === "pending"
+  const pendingEnrollments = db.filter(
+    "enrollments",
+    (e) => e.classroomId === req.params.id && e.status === "pending"
   );
-  res.json(pending.map(({ pinHash, ...safe }) => safe)); // never return the PIN hash
+  const result = pendingEnrollments.map((e) => {
+    const learner = db.find("learners", (l) => l.learnerId === e.learnerId);
+    return {
+      enrollmentId: e.enrollmentId,
+      learnerId: e.learnerId,
+      displayNickname: learner ? learner.displayNickname : "(unknown)",
+      createdAt: e.createdAt,
+    };
+  });
+  res.json(result);
 });
 
-app.post("/api/learners/:id/approve", requireTeacherAuthByLearnerId, (req, res) => {
-  const learner = db.update(
-    "learners",
-    (l) => l.learnerId === req.params.id,
-    { status: "active" }
-  );
+app.post("/api/enrollments/:id/approve", requireTeacherAuthByEnrollmentId, (req, res) => {
+  db.update("enrollments", (e) => e.enrollmentId === req.params.id, { status: "active" });
+  const learner = req.learner;
   const session = { token: codes.sessionToken(), learnerId: learner.learnerId, createdAt: new Date().toISOString() };
   db.insert("sessions", session);
-  res.json({ learner: safeLearner(learner), sessionToken: session.token });
+  res.json({
+    learner: safeLearner(learner),
+    classroomId: req.classroom.classroomId,
+    sessionToken: session.token,
+  });
 });
 
 // =========================================================================
@@ -164,34 +204,74 @@ app.post("/api/join", codeGuessLimiter, (req, res) => {
   const classroom = db.find("classrooms", (c) => c.joinCode === joinCode.toUpperCase());
   if (!classroom) return res.status(404).json({ error: "invalid_join_code" });
 
-  // returning-learner path: same nickname + matching PIN in this classroom
-  // resumes the existing learnerId instead of creating a duplicate pending
-  // request — auth-flow.md §4.
-  const existing = db.find(
-    "learners",
-    (l) => l.classroomId === classroom.classroomId && l.displayNickname === nickname
-  );
-  if (existing) {
-    if (existing.pinHash !== codes.hashSecret(pin)) {
+  // If the request carries a valid existing learner session, this is a
+  // RETURNING learner joining an ADDITIONAL classroom — attach a new
+  // enrollment to their existing learnerId instead of creating a second,
+  // disconnected identity. Each classroom still requires its own separate
+  // approval; joining classroom B does not inherit approval from A.
+  const presentedToken = extractToken(req);
+  if (presentedToken) {
+    const existingSession = db.find("sessions", (s) => s.token === presentedToken);
+    if (existingSession) {
+      const learner = db.find("learners", (l) => l.learnerId === existingSession.learnerId);
+      const already = db.find("enrollments", (e) => e.learnerId === learner.learnerId && e.classroomId === classroom.classroomId);
+      if (already) {
+        return res.status(already.status === "pending" ? 202 : 200).json({
+          status: already.status,
+          learner: safeLearner(learner),
+          classroomId: classroom.classroomId,
+          message: already.status === "pending" ? "Still waiting for teacher approval." : undefined,
+        });
+      }
+      const enrollment = {
+        enrollmentId: crypto.randomUUID(),
+        learnerId: learner.learnerId,
+        classroomId: classroom.classroomId,
+        status: "pending",
+        createdAt: new Date().toISOString(),
+      };
+      db.insert("enrollments", enrollment);
+      return res.status(202).json({ status: "pending", learnerId: learner.learnerId, message: "Waiting for your teacher to approve you." });
+    }
+  }
+
+  // No existing session presented — proceed with the original nickname+PIN
+  // flow, scoped to THIS classroom via the enrollments join (same security
+  // property as before: a nickname collision in an unrelated classroom
+  // can't resolve to someone else's identity here).
+  const enrollmentsInClass = db.filter("enrollments", (e) => e.classroomId === classroom.classroomId);
+  const existingLearnerId = enrollmentsInClass
+    .map((e) => ({ e, learner: db.find("learners", (l) => l.learnerId === e.learnerId) }))
+    .find(({ learner }) => learner && learner.displayNickname === nickname);
+
+  if (existingLearnerId) {
+    const { e: enrollment, learner } = existingLearnerId;
+    if (learner.pinHash !== codes.hashSecret(pin)) {
       return res.status(409).json({ error: "nickname_taken", message: "That name is already in use in this class — try another, or check your PIN." });
     }
-    if (existing.status === "pending") {
+    if (enrollment.status === "pending") {
       return res.status(202).json({ status: "pending", message: "Still waiting for teacher approval." });
     }
-    const session = { token: codes.sessionToken(), learnerId: existing.learnerId, createdAt: new Date().toISOString() };
+    const session = { token: codes.sessionToken(), learnerId: learner.learnerId, createdAt: new Date().toISOString() };
     db.insert("sessions", session);
-    return res.json({ status: "active", learner: safeLearner(existing), sessionToken: session.token });
+    return res.json({ status: "active", learner: safeLearner(learner), classroomId: classroom.classroomId, sessionToken: session.token });
   }
 
   const learner = {
     learnerId: crypto.randomUUID(),
-    classroomId: classroom.classroomId,
     displayNickname: nickname,
     pinHash: codes.hashSecret(pin),
-    status: "pending",
     createdAt: new Date().toISOString(),
   };
   db.insert("learners", learner);
+  const enrollment = {
+    enrollmentId: crypto.randomUUID(),
+    learnerId: learner.learnerId,
+    classroomId: classroom.classroomId,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+  };
+  db.insert("enrollments", enrollment);
   res.status(202).json({ status: "pending", learnerId: learner.learnerId, message: "Waiting for your teacher to approve you." });
 });
 
@@ -200,7 +280,16 @@ app.post("/api/session/resume", (req, res) => {
   const session = db.find("sessions", (s) => s.token === token);
   if (!session) return res.status(401).json({ error: "invalid_session" });
   const learner = db.find("learners", (l) => l.learnerId === session.learnerId);
-  res.json({ learner: safeLearner(learner) });
+
+  // Returns every classroom this learner belongs to, each with its own
+  // status — the client needs this to know which dashboard(s) to show,
+  // and to correctly attribute future events to the right classroom.
+  const enrollments = db.filter("enrollments", (e) => e.learnerId === learner.learnerId).map((e) => {
+    const classroom = db.find("classrooms", (c) => c.classroomId === e.classroomId);
+    return { classroomId: e.classroomId, className: classroom ? classroom.name : null, status: e.status };
+  });
+
+  res.json({ learner: safeLearner(learner), enrollments });
 });
 
 // =========================================================================
@@ -265,7 +354,11 @@ app.post("/api/events", (req, res) => {
     serverTimestamp: new Date().toISOString(),
     ...event,
   };
-  if (event.stepType === "open_writing" && event.responseValue) {
+  // Any free-form response type gets the same short retention treatment —
+  // open_speaking (added with the Listening/Speaking track) is exactly as
+  // personal as open_writing and was missing this check until now.
+  const FREE_FORM_TYPES = ["open_writing", "open_speaking"];
+  if (FREE_FORM_TYPES.includes(event.stepType) && event.responseValue) {
     record.responseRetentionExpiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
   }
   db.insert("events", record);
@@ -400,6 +493,18 @@ app.post("/api/feedback", feedbackLimiter, async (req, res) => {
 const PORT = process.env.PORT || 4000;
 if (require.main === module) {
   app.listen(PORT, () => console.log(`دفتر backend listening on :${PORT}`));
+
+  // Sweep once on startup — catches anything that expired while the
+  // process was down or mid-restart, since nothing else was running to
+  // catch it — then keep sweeping hourly. Kept inside require.main so
+  // importing this file as a module (e.g. for tests) never starts a
+  // background timer as a side effect.
+  const sweepAndLog = () => {
+    const count = sweepExpiredResponses();
+    if (count > 0) console.log(`retention sweep: cleared ${count} expired response(s)`);
+  };
+  sweepAndLog();
+  setInterval(sweepAndLog, 60 * 60 * 1000);
 }
 
 module.exports = app;
