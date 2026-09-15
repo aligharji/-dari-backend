@@ -10,6 +10,7 @@ against this exact code.
 npm install
 node server.js        # listens on :4000 (set PORT to change)
 node test/flow-test.js  # runs the full flow against a live server and prints every response
+node test/account-flow-test.js  # same, for the email-account system specifically
 ```
 
 Storage is a flat `data.json` file (see `lib/db.js` for why — this was a
@@ -21,6 +22,29 @@ mounted persistent volume (e.g. `/data` on Northflank) before deploying —
 without it, `data.json` lives in the container's normal filesystem and gets
 wiped on every restart or redeploy. Locally, leave `DATA_DIR` unset; it
 defaults to the project folder and needs no setup.
+
+**Environment variables:**
+
+| Variable | Required for | Notes |
+|---|---|---|
+| `DATA_DIR` | Persistent storage in production | Unset = local project folder |
+| `GROQ_API_KEY` | `/api/feedback` | Missing = `503 feedback_not_configured`, not a crash |
+| `WIX_API_KEY` | `/api/auth/request-magic-link` | A Wix API key with the `shoutout.manage` permission scope on the site. Missing = email isn't sent, but the request still succeeds and the token is logged server-side for manual testing |
+| `WIX_SITE_ID` | Same as above | The Wix site's ID (sent as the `wix-site-id` header) |
+| `WIX_SENDER_EMAIL` | Real teacher accounts | See the ⚠️ below — must already be verified via Wix's Sender Emails API |
+| `FRONTEND_URL` | Clickable magic links | Without it, the email still sends but only contains the raw code, not a clickable link |
+
+**⚠️ `WIX_SENDER_EMAIL` — read before relying on teacher accounts.**
+Tested directly against the real `aligharji.co.uk` Wix site before this was
+wired in: an **unverified** sender gets a hard `428 UNVERIFIED_SENDER_EMAIL`
+rejection — nothing sends, to anyone, no silent partial-functionality
+fallback (this is stricter but more honest than Resend's old behavior,
+where an unverified sender would silently succeed but only deliver to the
+account owner). Once `WIX_SENDER_EMAIL` is a verified sender (Wix's
+Sender Emails API — create, send a verification code, verify with the
+code received in that inbox), sending to an arbitrary external recipient
+works cleanly — confirmed with a real transactional email, accepted and
+delivered, not just a `200 OK` on the request.
 
 ## Endpoints
 
@@ -39,6 +63,9 @@ defaults to the project folder and needs no setup.
 | `POST /api/events` | Log one `interaction_event` or `lesson_summary` |
 | `GET /api/learners/:id/mastery?tagField=grammarPoint\|vocabDomain&tagId=...` | Compute the rolling mastery percentage for one tag |
 | `POST /api/feedback` | Proxy `{system, message}` to Groq, returns `{text}`. Rate-limited (30/10min) since these calls cost real money. Requires `GROQ_API_KEY`. |
+| `POST /api/auth/request-magic-link` | Teacher account — email a one-time sign-in link via Wix's Email Transmissions API (rate-limited). Requires `WIX_API_KEY`/`WIX_SITE_ID`/`WIX_SENDER_EMAIL`; degrades gracefully if unset (logs the token server-side, doesn't crash). |
+| `POST /api/auth/verify` | Exchange a magic-link token for a `teacherSessionToken`. Single-use, 15-minute expiry. |
+| `GET /api/teachers/me/classrooms` | List every classroom linked to the signed-in teacher account, across devices. |
 
 ## What's real vs. what's still a stand-in
 
@@ -55,6 +82,38 @@ defaults to the project folder and needs no setup.
   concretely: one simulated client correctly gets rate-limited at
   request 21, while a second, different simulated client is completely
   unaffected — proving per-client buckets, not one shared global one.
+- **Teacher accounts via email magic link**: real identity, separate from
+  every self-custody-code credential elsewhere in this system. Verified
+  end-to-end: request → single-use, 15-minute-expiry token → verify →
+  session. A classroom created while signed in becomes accessible by
+  *either* its own `teacherToken` *or* the account session — both
+  credentials tested working side by side on the same classroom. Cross-
+  tenant isolation verified directly with two genuinely different teacher
+  accounts: teacher B correctly gets `401` on teacher A's classroom, and
+  that classroom correctly never appears in B's
+  `/api/teachers/me/classrooms` list. Anonymous (no-account) classroom
+  creation — the original flow — verified still working completely
+  unchanged, `ownerTeacherId: null`. **Client-side is now wired too**
+  (`dari-app-landing.html`): sign-in form, a "check your email" screen
+  covering both delivery paths the email actually contains (clickable
+  link via `?magicToken=`, or manual code entry), and the Teacher
+  classroom list merges account-fetched classrooms with locally-stored
+  ones — tested via static analysis (every `go({screen})` target has a
+  matching dispatch branch, no orphaned function definitions from editing
+  mistakes) since a live browser click-through wasn't possible from here.
+  The one real limitation is still external, not architectural: see the
+  `WIX_SENDER_EMAIL` warning above — email delivery itself is now proven
+  end-to-end against the real `aligharji.co.uk` site, using the *actual*
+  production magic-link HTML content (not generic test copy — that
+  distinction mattered: a first test with placeholder text was silently
+  `REJECTED` for `BLACKLISTED_TEXT` despite an initial `ACCEPTED` response,
+  which would have looked identical to success without checking
+  `GetEmailTransmission` afterward). The real content was confirmed
+  **actually received in a real inbox**, not just accepted by the API.
+  What's still needed: `WIX_API_KEY`/`WIX_SITE_ID` generated from the Wix
+  dashboard and set as environment variables — the live tests above used
+  Claude's own connected Wix session, not a standalone credential the
+  deployed server can reuse autonomously.
 - Mastery rollup computed from the raw event log, not stored redundantly
 - **Retention sweep**: `open_writing` and `open_speaking` responses are
   cleared (`responseValue` set to `null`, rest of the record kept intact)

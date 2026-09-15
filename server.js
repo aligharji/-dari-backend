@@ -42,6 +42,152 @@ const codeGuessLimiter = rateLimit({
 });
 
 // =========================================================================
+// AUTH: real teacher accounts via email magic link.
+//
+// This is genuinely different from every other credential in this system —
+// everything else so far (join codes, PINs, teacherToken, recoveryCode) is
+// a self-custody secret with no external identity behind it. A magic link
+// is the first thing here that actually requires sending mail.
+//
+// Email is sent via Wix's own Email Transmissions API, not a third-party
+// provider — tested live against the real aligharji.co.uk Wix site before
+// this was wired in, not assumed from docs alone. Two things confirmed
+// directly, not just read: (1) an unverified sender is HARD REJECTED
+// (`428 UNVERIFIED_SENDER_EMAIL`), no silent partial-functionality fallback
+// the way Resend's unverified default sender has; (2) with a verified
+// sender, sending to an arbitrary external recipient (not an existing Wix
+// contact) is accepted cleanly — confirmed via `toRecipients[].emailAddress`,
+// which auto-creates a contact if one doesn't already exist.
+// =========================================================================
+
+const authLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 10, // requesting a magic link repeatedly should be rare for a real user
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "too_many_attempts", message: "Try again later." },
+});
+
+function isValidEmail(email) {
+  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+async function sendMagicLinkEmail(email, magicLinkUrl, rawToken) {
+  if (!process.env.WIX_API_KEY || !process.env.WIX_SITE_ID) {
+    return { sent: false, reason: "WIX_API_KEY or WIX_SITE_ID not set" };
+  }
+  // WIX_SENDER_EMAIL must already be verified via the Sender Emails API
+  // (dashboard or API) — an unverified sender gets a hard 428 rejection,
+  // confirmed directly against the real site, not assumed.
+  const senderEmail = process.env.WIX_SENDER_EMAIL;
+  if (!senderEmail) {
+    return { sent: false, reason: "WIX_SENDER_EMAIL not set" };
+  }
+  try {
+    const res = await fetch("https://www.wixapis.com/email-transmissions/v1/email-transmissions/send", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": process.env.WIX_API_KEY,
+        "wix-site-id": process.env.WIX_SITE_ID,
+      },
+      body: JSON.stringify({
+        emailTransmission: {
+          emailSubject: "لینک ورود به دفتر",
+          emailHtmlContent: `
+            <p>برای ورود به حساب معلم خودت، روی این لینک کلیک کن:</p>
+            <p><a href="${magicLinkUrl}">${magicLinkUrl}</a></p>
+            <p>اگر لینک کار نکرد، این کد را در برنامه وارد کن:</p>
+            <p style="font-family: monospace; font-size: 18px;">${rawToken}</p>
+            <p style="color: #888; font-size: 12px;">این لینک تا ۱۵ دقیقه معتبر است.</p>
+          `,
+          senderName: "دفتر",
+          senderEmailAddress: senderEmail,
+          toRecipients: [{ emailAddress: email }],
+          type: "TRANSACTIONAL",
+        },
+        idempotencyKey: crypto.randomUUID(),
+      }),
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      return { sent: false, reason: `Wix returned ${res.status}: ${detail.slice(0, 200)}` };
+    }
+    const data = await res.json();
+    return { sent: data.emailTransmission?.status === "ACCEPTED", reason: data.emailTransmission?.status };
+  } catch (e) {
+    return { sent: false, reason: "request to Wix failed" };
+  }
+}
+
+app.post("/api/auth/request-magic-link", authLimiter, async (req, res) => {
+  const { email } = req.body;
+  if (!isValidEmail(email)) return res.status(400).json({ error: "invalid_email" });
+
+  let teacher = db.find("teachers", (t) => t.email === email.toLowerCase());
+  if (!teacher) {
+    teacher = { teacherId: crypto.randomUUID(), email: email.toLowerCase(), createdAt: new Date().toISOString() };
+    db.insert("teachers", teacher);
+  }
+
+  const token = codes.sessionToken();
+  const magicLink = {
+    token,
+    teacherId: teacher.teacherId,
+    email: teacher.email,
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    usedAt: null,
+  };
+  db.insert("magicLinks", magicLink);
+
+  const frontendUrl = process.env.FRONTEND_URL || "";
+  const magicLinkUrl = frontendUrl
+    ? `${frontendUrl}${frontendUrl.includes("?") ? "&" : "?"}magicToken=${token}`
+    : `(no FRONTEND_URL configured — use the raw code below)`;
+
+  const emailResult = await sendMagicLinkEmail(teacher.email, magicLinkUrl, token);
+  if (!emailResult.sent) {
+    // Don't fail the request over a misconfigured/unreachable email
+    // provider during development — but don't pretend it worked either.
+    console.log(`magic-link email NOT sent (${emailResult.reason}) — token for manual testing: ${token}`);
+  }
+
+  res.json({ message: "If that email is valid, a sign-in link has been sent.", emailSent: emailResult.sent });
+});
+
+app.post("/api/auth/verify", authLimiter, (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: "token required" });
+
+  const magicLink = db.find("magicLinks", (m) => m.token === token);
+  if (!magicLink) return res.status(404).json({ error: "invalid_token" });
+  if (magicLink.usedAt) return res.status(410).json({ error: "token_already_used" });
+  if (new Date(magicLink.expiresAt) < new Date()) return res.status(410).json({ error: "token_expired" });
+
+  db.update("magicLinks", (m) => m.token === token, { usedAt: new Date().toISOString() });
+
+  const session = { token: codes.sessionToken(), teacherId: magicLink.teacherId, createdAt: new Date().toISOString() };
+  db.insert("teacherSessions", session);
+
+  res.json({ teacherId: magicLink.teacherId, email: magicLink.email, sessionToken: session.token });
+});
+
+function requireTeacherSession(req, res, next) {
+  const token = extractToken(req);
+  if (!token) return res.status(401).json({ error: "unauthorized" });
+  const session = db.find("teacherSessions", (s) => s.token === token);
+  if (!session) return res.status(401).json({ error: "unauthorized" });
+  req.teacherId = session.teacherId;
+  next();
+}
+
+app.get("/api/teachers/me/classrooms", requireTeacherSession, (req, res) => {
+  const classrooms = db.filter("classrooms", (c) => c.ownerTeacherId === req.teacherId);
+  res.json(classrooms.map(({ teacherTokenHash, recoveryCodeHash, ...safe }) => safe));
+});
+
+// =========================================================================
 // TEACHER: create + manage a classroom
 // =========================================================================
 
@@ -64,6 +210,19 @@ app.post("/api/classrooms", (req, res) => {
   // self-custody-code pattern as every other secret in this system.
   const teacherToken = codes.sessionToken();
   const recovery = codes.recoveryCode();
+
+  // If the request carries a valid teacher-account session, link this
+  // classroom to that account so it shows up via /api/teachers/me/classrooms
+  // on any device. This is purely additive — the classroom still gets its
+  // own independent teacherToken/recoveryCode exactly as before, so
+  // anonymous (no-account) classroom creation keeps working unchanged.
+  let ownerTeacherId = null;
+  const sessionToken = extractToken(req);
+  if (sessionToken) {
+    const session = db.find("teacherSessions", (s) => s.token === sessionToken);
+    if (session) ownerTeacherId = session.teacherId;
+  }
+
   const classroom = {
     classroomId: crypto.randomUUID(),
     teacherId,
@@ -72,6 +231,7 @@ app.post("/api/classrooms", (req, res) => {
     joinCodeCreatedAt: new Date().toISOString(),
     teacherTokenHash: codes.hashSecret(teacherToken),
     recoveryCodeHash: codes.hashSecret(recovery),
+    ownerTeacherId,
   };
   db.insert("classrooms", classroom);
   const { teacherTokenHash, recoveryCodeHash, ...safeClassroom } = classroom;
@@ -114,11 +274,27 @@ function extractToken(req) {
   return header.startsWith("Bearer ") ? header.slice(7) : null;
 }
 
+// Shared by every teacher-auth check below: a classroom is unlocked either
+// by its own per-classroom teacherToken (the original, still-primary
+// credential), OR by a teacher-account session token whose teacherId
+// matches the classroom's ownerTeacherId (only set if the classroom was
+// created while signed in). Centralized here so the two-credential check
+// only has to be written once, not reimplemented per middleware.
+function isAuthorizedTeacherToken(token, classroom) {
+  if (!token || !classroom) return false;
+  if (codes.hashSecret(token) === classroom.teacherTokenHash) return true;
+  if (classroom.ownerTeacherId) {
+    const session = db.find("teacherSessions", (s) => s.token === token);
+    if (session && session.teacherId === classroom.ownerTeacherId) return true;
+  }
+  return false;
+}
+
 function requireTeacherAuthByClassroomId(req, res, next) {
   const classroom = db.find("classrooms", (c) => c.classroomId === req.params.id);
   if (!classroom) return res.status(404).json({ error: "classroom_not_found" });
   const token = extractToken(req);
-  if (!token || codes.hashSecret(token) !== classroom.teacherTokenHash) {
+  if (!isAuthorizedTeacherToken(token, classroom)) {
     return res.status(401).json({ error: "unauthorized_teacher" });
   }
   req.classroom = classroom;
@@ -135,7 +311,7 @@ function requireTeacherAuthByEnrollmentId(req, res, next) {
   const classroom = db.find("classrooms", (c) => c.classroomId === enrollment.classroomId);
   if (!classroom) return res.status(404).json({ error: "classroom_not_found" });
   const token = extractToken(req);
-  if (!token || codes.hashSecret(token) !== classroom.teacherTokenHash) {
+  if (!isAuthorizedTeacherToken(token, classroom)) {
     return res.status(401).json({ error: "unauthorized_teacher" });
   }
   const learner = db.find("learners", (l) => l.learnerId === enrollment.learnerId);
@@ -158,7 +334,7 @@ function requireTeacherAuthByLearnerId(req, res, next) {
   const learnerClassroomIds = db.filter("enrollments", (e) => e.learnerId === learner.learnerId).map((e) => e.classroomId);
   const matchingClassroom = learnerClassroomIds
     .map((cid) => db.find("classrooms", (c) => c.classroomId === cid))
-    .find((c) => c && codes.hashSecret(token) === c.teacherTokenHash);
+    .find((c) => isAuthorizedTeacherToken(token, c));
 
   if (!matchingClassroom) return res.status(401).json({ error: "unauthorized_teacher" });
   req.classroom = matchingClassroom;
@@ -188,7 +364,7 @@ function requireLearnerDataAccess(req, res, next) {
   const learnerClassroomIds = db.filter("enrollments", (e) => e.learnerId === learner.learnerId).map((e) => e.classroomId);
   const asTeacher = learnerClassroomIds
     .map((cid) => db.find("classrooms", (c) => c.classroomId === cid))
-    .some((c) => c && codes.hashSecret(token) === c.teacherTokenHash);
+    .some((c) => isAuthorizedTeacherToken(token, c));
   if (asTeacher) { req.learner = learner; return next(); }
 
   return res.status(401).json({ error: "unauthorized" });
