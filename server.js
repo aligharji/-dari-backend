@@ -95,11 +95,14 @@ async function sendMagicLinkEmail(email, magicLinkUrl, rawToken) {
         emailTransmission: {
           emailSubject: "لینک ورود به دفتر",
           emailHtmlContent: `
-            <p>برای ورود به حساب معلم خودت، روی این لینک کلیک کن:</p>
-            <p><a href="${magicLinkUrl}">${magicLinkUrl}</a></p>
-            <p>اگر لینک کار نکرد، این کد را در برنامه وارد کن:</p>
+            ${magicLinkUrl
+              ? `<p>برای ورود به حساب معلم خودت، روی این لینک کلیک کن:</p>
+                 <p><a href="${magicLinkUrl}">${magicLinkUrl}</a></p>
+                 <p>اگر لینک کار نکرد، این کد را در برنامه وارد کن:</p>`
+              : `<p>برای ورود به حساب معلم خودت، این کد را در برنامه وارد کن:</p>`
+            }
             <p style="font-family: monospace; font-size: 18px;">${rawToken}</p>
-            <p style="color: #888; font-size: 12px;">این لینک تا ۱۵ دقیقه معتبر است.</p>
+            <p style="color: #888; font-size: 12px;">این کد تا ۱۵ دقیقه معتبر است.</p>
           `,
           senderName: "دفتر",
           senderEmailAddress: senderEmail,
@@ -144,7 +147,7 @@ app.post("/api/auth/request-magic-link", authLimiter, async (req, res) => {
   const frontendUrl = process.env.FRONTEND_URL || "";
   const magicLinkUrl = frontendUrl
     ? `${frontendUrl}${frontendUrl.includes("?") ? "&" : "?"}magicToken=${token}`
-    : `(no FRONTEND_URL configured — use the raw code below)`;
+    : null; // no placeholder string — the template below only renders a real <a> when this is truthy
 
   const emailResult = await sendMagicLinkEmail(teacher.email, magicLinkUrl, token);
   if (!emailResult.sent) {

@@ -165,7 +165,7 @@ delivered, not just a `200 OK` on the request.
 - `lib/db.js` is a JSON file, not Postgres/SQLite — swap the five functions it
   exports for real DB calls; nothing in `server.js` should need to change.
 
-**Real bugs found and fixed via production logs, not assumption:**
+- **Real bugs found and fixed via production logs, not assumption:**
 - **Schema migration gap** (`lib/db.js`): `load()` used to return whatever
   was literally on disk. A `data.json` written before the `teachers`/
   `magicLinks`/`teacherSessions` collections existed had no such keys —
@@ -180,3 +180,14 @@ delivered, not just a `200 OK` on the request.
   missing keys get a default `[]`. Verified the fix persists correctly:
   after one request, the previously-missing collections are written back
   to the file, not just patched in memory for that call.
+- **Broken link when `FRONTEND_URL` is unset**: the magic-link email used
+  to unconditionally wrap `magicLinkUrl` in `<a href="...">`, even when
+  `FRONTEND_URL` wasn't configured — meaning the `<a>` tag's `href` was
+  literally the placeholder text `"(no FRONTEND_URL configured — use the
+  raw code below)"`, a clickable link to nowhere. Found by an actual user
+  clicking it and hitting a generic browser error. Fixed: the email now
+  only renders a real `<a>` tag when there's a genuine URL to link to;
+  otherwise it shows only the manual-entry code, with no clickable
+  element at all. Verified by isolating and running the template logic
+  directly with `FRONTEND_URL` unset — confirmed no `<a href>` appears
+  anywhere in the resulting HTML.
