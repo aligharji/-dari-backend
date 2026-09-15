@@ -164,3 +164,19 @@ delivered, not just a `200 OK` on the request.
 **Deliberate stand-ins, not bugs:**
 - `lib/db.js` is a JSON file, not Postgres/SQLite — swap the five functions it
   exports for real DB calls; nothing in `server.js` should need to change.
+
+**Real bugs found and fixed via production logs, not assumption:**
+- **Schema migration gap** (`lib/db.js`): `load()` used to return whatever
+  was literally on disk. A `data.json` written before the `teachers`/
+  `magicLinks`/`teacherSessions` collections existed had no such keys —
+  the first real request to touch `db.find("teachers", ...)` crashed with
+  `Cannot read properties of undefined (reading 'find')`. This surfaced as
+  a genuine `500` on the live deployed backend, root-caused from the
+  actual Northflank stderr log (not guessed), then reproduced locally by
+  writing an old-shaped file and confirming the same crash before fixing
+  it. Fix: `load()` now merges onto `emptyState()`'s defaults, so any
+  collection added to the schema later gets backfilled into old files
+  automatically — existing data is never overwritten, only genuinely
+  missing keys get a default `[]`. Verified the fix persists correctly:
+  after one request, the previously-missing collections are written back
+  to the file, not just patched in memory for that call.
